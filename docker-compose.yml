@@ -1,0 +1,155 @@
+x-traefik-common-labels: &traefik_common_labels
+  traefik.enable: "true"
+  traefik.docker.network: "${TRAEFIK_NETWORK:-xmpp-traefik}"
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16.9}
+    container_name: prosody-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-prosody}
+      POSTGRES_USER: ${POSTGRES_USER:-prosody}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - ${PROJECT_DIR:-.}/postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - xmpp-net
+
+  prosody:
+    build:
+      context: ${PROJECT_DIR:-.}/prosody
+      args:
+        PROSODY_IMAGE: ${PROSODY_IMAGE:-prosodyim/prosody:0.12}
+    container_name: prosody
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      filer:
+        condition: service_healthy
+    environment:
+      PROSODY_DOMAIN: ${PROSODY_DOMAIN:-example.com}
+      PROSODY_ADMIN_JID: ${PROSODY_ADMIN_JID:-admin@example.com}
+      PROSODY_DB_NAME: ${POSTGRES_DB:-prosody}
+      PROSODY_DB_USER: ${POSTGRES_USER:-prosody}
+      PROSODY_DB_HOST: postgres
+      PROSODY_DB_PASSWORD_FILE: /run/secrets/postgres_password
+      PROSODY_FILER_SECRET_FILE: /run/secrets/filer_secret
+      PROSODY_UPLOAD_BASE_URL: "https://${UPLOAD_DOMAIN}/"
+      PROSODY_UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-20971520}
+      PROSODY_TURN_HOST: ${PROSODY_TURN_HOST}
+      PROSODY_TURN_SECRET_FILE: /run/secrets/turn_secret
+    secrets:
+      - postgres_password
+      - filer_secret
+      - turn_secret
+    volumes:
+      - ${PROJECT_DIR:-.}/prosody-data:/var/lib/prosody
+      - ${PROJECT_DIR:-.}/prosody-config:/etc/prosody
+      - ${PROJECT_DIR:-.}/prosody-certs:/etc/prosody/certs
+    ports:
+      - "5222:5222"
+      - "5269:5269"
+    networks:
+      - xmpp-net
+
+  filer:
+    build: ${PROJECT_DIR:-.}/filer
+    container_name: prosody-filer
+    restart: unless-stopped
+    environment:
+      STORAGE_BOX_URL: ${STORAGE_BOX_URL}
+      STORAGE_BOX_USER: ${STORAGE_BOX_USER}
+      STORAGE_BOX_PASSWORD_FILE: /run/secrets/storage_box_password
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-20971520}
+      FILER_SECRET_FILE: /run/secrets/filer_secret
+    secrets:
+      - filer_secret
+      - storage_box_password
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      <<: *traefik_common_labels
+      traefik.http.routers.xmpp-filer.entrypoints: "websecure"
+      traefik.http.routers.xmpp-filer.rule: "Host(`${UPLOAD_DOMAIN:-upload.localhost}`)"
+      traefik.http.routers.xmpp-filer.tls: "true"
+      traefik.http.routers.xmpp-filer.tls.certresolver: "${TRAEFIK_CERT_RESOLVER:-letsencrypt}"
+      traefik.http.routers.xmpp-filer.tls.domains[0].main: "${PROSODY_DOMAIN:-example.com}"
+      traefik.http.routers.xmpp-filer.tls.domains[1].main: "${UPLOAD_DOMAIN:-upload.localhost}"
+      traefik.http.services.xmpp-filer.loadbalancer.server.port: "8080"
+    networks:
+      - xmpp-net
+      - traefik
+
+  traefik-certs-dumper:
+    image: ${TRAEFIK_CERTS_DUMPER_IMAGE:-ghcr.io/ldez/traefik-certs-dumper:v2.10}
+    container_name: traefik-certs-dumper
+    restart: unless-stopped
+    profiles:
+      - traefik
+    command:
+      - file
+      - --watch
+      - --source=/acme.json
+      - --dest=/certs
+      - --domain-subdir
+    volumes:
+      - type: bind
+        source: ${TRAEFIK_ACME_JSON:-/dev/null}
+        target: /acme.json
+        read_only: true
+      - ${PROJECT_DIR:-.}/prosody-certs:/certs
+    networks:
+      - xmpp-net
+
+  coturn:
+    image: ${COTURN_IMAGE:-coturn/coturn:4.6.3}
+    container_name: coturn
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      COTURN_REALM: ${PROSODY_DOMAIN:-example.com}
+    secrets:
+      - turn_secret
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      exec turnserver \
+        --realm="$$COTURN_REALM" \
+        --use-auth-secret \
+        --static-auth-secret="$(cat /run/secrets/turn_secret)" \
+        --log-file=stdout \
+        --no-multicast-peers \
+        --min-port=49152 \
+        --max-port=65535 \
+        --denied-peer-ip=10.0.0.0-10.255.255.255 \
+        --denied-peer-ip=172.16.0.0-172.31.255.255 \
+        --denied-peer-ip=192.168.0.0-192.168.255.255
+
+secrets:
+  postgres_password:
+    file: ${SECRETS_DIR:-./secrets}/postgres_password.txt
+  filer_secret:
+    file: ${SECRETS_DIR:-./secrets}/filer_secret.txt
+  storage_box_password:
+    file: ${SECRETS_DIR:-./secrets}/storage_box_password.txt
+  turn_secret:
+    file: ${SECRETS_DIR:-./secrets}/turn_secret.txt
+
+networks:
+  xmpp-net:
+  traefik:
+    external: ${TRAEFIK_EXTERNAL:-false}
+    name: ${TRAEFIK_NETWORK:-xmpp-traefik}
